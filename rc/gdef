@@ -1,0 +1,4 @@
+#!/usr/bin/env rc
+
+echo
+godef -acme -a | tail -n+2 | grep -v -e '^[[:space:]]*$'
