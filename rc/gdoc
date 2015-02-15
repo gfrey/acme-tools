@@ -1,0 +1,5 @@
+#!/usr/bin/env rc
+
+echo
+godef -acme | tail -n+2
+agodoc
