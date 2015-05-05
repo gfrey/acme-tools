@@ -137,9 +137,7 @@ func loadProgram(filename string) (*loader.Program, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = conf.CreateFromFilenames(f.Name.Name, filename); err != nil {
-		return nil, err
-	}
+	conf.CreateFromFilenames(f.Name.Name, filename)
 	return conf.Load()
 }
 
