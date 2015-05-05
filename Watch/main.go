@@ -142,6 +142,11 @@ func watchDeep(w *fsnotify.Watcher, path string) {
 		return
 	}
 
+	switch info.Name() {
+	case ".git", "Godep": // ignore
+		return
+	}
+
 	if err := w.Watch(path); err != nil {
 		die(err)
 	}
