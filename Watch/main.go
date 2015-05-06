@@ -14,50 +14,56 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
-	"github.com/howeyc/fsnotify"
+	"gopkg.in/fsnotify.v1"
 )
 
 var path = flag.String("p", ".", "specify the path to watch")
 
-// Win is the acme window.
-var win *acme.Win
-
 func main() {
 	flag.Parse()
 
-	var err error
-	win, err = acme.New()
+	var (
+		win *acme.Win
+		err error
+	)
+
+	err = func() error {
+		win, err = acme.New()
+		if err != nil {
+			return err
+		}
+
+		if wd, err := os.Getwd(); err != nil {
+			return err
+		} else {
+			win.Ctl("dumpdir %s", wd)
+		}
+		win.Ctl("dump %s", strings.Join(os.Args, " "))
+
+		abs, err := filepath.Abs(*path)
+		if err != nil {
+			return err
+		}
+		switch info, err := os.Stat(abs); {
+		case err != nil:
+			return err
+		case info.IsDir():
+			abs += "/"
+		}
+
+		win.Name(abs + "+watch")
+		win.Ctl("clean")
+		win.Fprintf("tag", "Get ")
+
+		run := make(chan runRequest)
+		go events(win, run)
+		go runner(win, run)
+		return watcher(abs, run)
+	}()
 	if err != nil {
-		die(err)
+		win.Ctl("delete")
+		log.Fatal(err.Error())
 	}
-
-	if wd, err := os.Getwd(); err != nil {
-		log.Println(err)
-	} else {
-		win.Ctl("dumpdir %s", wd)
-	}
-	win.Ctl("dump %s", strings.Join(os.Args, " "))
-
-	abs, err := filepath.Abs(*path)
-	if err != nil {
-		die(err)
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		die(err)
-	}
-	if info.IsDir() {
-		abs += "/"
-	}
-
-	win.Name(abs + "+watch")
-	win.Ctl("clean")
-	win.Fprintf("tag", "Get ")
-
-	run := make(chan runRequest)
-	go events(run)
-	go runner(run)
-	watcher(*path, run)
 }
 
 // A runRequests is sent to the runner to request
@@ -76,52 +82,36 @@ type runRequest struct {
 
 // Watcher watches the directory and sends a
 // runRequest when the watched path changes.
-func watcher(path string, run chan<- runRequest) {
+func watcher(path string, run chan<- runRequest) error {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		die(err)
+		return err
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		die(err)
-	}
-	if !info.IsDir() {
-		// watchDeep is a no-op on regular files.
-		if err := w.Watch(path); err != nil {
-			die(err)
-		}
-	} else {
-		watchDeep(w, path)
+	if err := watchDeep(w, path); err != nil {
+		return err
 	}
 
 	done := make(chan bool)
 	for {
 		select {
-		case ev := <-w.Event:
-			if ev.IsCreate() {
-				watchDeep(w, ev.Name)
-			}
-
-			info, err := os.Stat(ev.Name)
-			for os.IsNotExist(err) {
-				dir, _ := filepath.Split(ev.Name)
-				if dir == "" {
-					break
+		case ev := <-w.Events:
+			switch ev.Op {
+			case fsnotify.Create:
+				if err := watchDeep(w, ev.Name); err != nil {
+					return err
 				}
-				info, err = os.Stat(dir)
-				if dir == path && os.IsNotExist(err) {
-					die(errors.New("Watch point " + path + " deleted"))
+			case fsnotify.Remove:
+				// watcher must not be removed as it is already gone (automagic)
+				if strings.HasPrefix(path, ev.Name) {
+					return errors.New("Watch point " + path + " deleted")
 				}
 			}
-			if err != nil {
-				die(err)
-			}
-			run <- runRequest{info.ModTime(), done}
+			run <- runRequest{time.Now(), done}
 			<-done
 
-		case err := <-w.Error:
-			die(err)
+		case err := <-w.Errors:
+			return err
 		}
 	}
 }
@@ -129,52 +119,35 @@ func watcher(path string, run chan<- runRequest) {
 // WatchDeep watches a directory and all
 // of its subdirectories.  If the path is not
 // a directory then watchDeep is a no-op.
-func watchDeep(w *fsnotify.Watcher, path string) {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		// This file disapeared on us, fine.
-		return
+func watchDeep(w *fsnotify.Watcher, root string) error {
+	if err := w.Add(root); err != nil {
+		return err
 	}
-	if err != nil {
-		die(err)
-	}
-	if !info.IsDir() {
-		return
-	}
-
-	switch info.Name() {
-	case ".git", "Godep": // ignore
-		return
-	}
-
-	if err := w.Watch(path); err != nil {
-		die(err)
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		die(err)
-	}
-	ents, err := f.Readdirnames(-1)
-	if err != nil {
-		die(err)
-	}
-	f.Close()
-
-	for _, e := range ents {
-		watchDeep(w, filepath.Join(path, e))
-	}
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		switch {
+		case os.IsNotExist(err):
+			return nil
+		case err != nil:
+			return err
+		case !info.IsDir():
+			return nil
+		case info.Name() == ".git", info.Name() == "Godeps":
+			return filepath.SkipDir
+		default:
+			return w.Add(path)
+		}
+	})
 }
 
 // Runner runs the commond upon
 // receiving an up-to-date runRequest.
-func runner(reqs <-chan runRequest) {
-	runCommand()
+func runner(win *acme.Win, reqs <-chan runRequest) {
+	runCommand(win)
 	last := time.Now()
 
 	for req := range reqs {
 		if last.Before(req.time) {
-			runCommand()
+			runCommand(win)
 			last = time.Now()
 		}
 		req.done <- true
@@ -207,47 +180,54 @@ func (b BodyWriter) Write(data []byte) (int, error) {
 
 // RunCommand runs the command and sends
 // the result to the given acme window.
-func runCommand() {
-	args := flag.Args()
-	if len(args) == 0 {
-		die(errors.New("Must supply a command"))
-	}
-	cmdStr := strings.Join(args, " ")
+func runCommand(win *acme.Win) {
+	err := func() error {
+		args := flag.Args()
+		if len(args) == 0 {
+			return errors.New("Must supply a command")
+		}
+		cmdStr := strings.Join(args, " ")
 
-	win.Addr(",")
-	win.Write("data", nil)
-	win.Ctl("clean")
-	win.Fprintf("body", "$ %s\n", cmdStr)
+		win.Addr(",")
+		win.Write("data", nil)
+		win.Ctl("clean")
+		win.Fprintf("body", "$ %s\n", cmdStr)
 
-	cmd := exec.Command(args[0], args[1:]...)
-	r, w, err := os.Pipe()
+		cmd := exec.Command(args[0], args[1:]...)
+		r, w, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		cmd.Stdout = w
+		cmd.Stderr = w
+
+		if err := cmd.Start(); err != nil {
+			win.Fprintf("body", "%s: %s\n", cmdStr, err)
+			return err
+		}
+		w.Close()
+		io.Copy(BodyWriter{win}, r)
+		if err := cmd.Wait(); err != nil {
+			win.Fprintf("body", "%s: %s\n", cmdStr, err)
+		}
+
+		win.Fprintf("body", "%s\n", time.Now())
+		win.Fprintf("addr", "#0")
+		win.Ctl("dot=addr")
+		win.Ctl("show")
+		win.Ctl("clean")
+		return nil
+	}()
 	if err != nil {
-		die(err)
+		win.Ctl("delete")
+		log.Fatal(err.Error())
 	}
-	defer r.Close()
-	cmd.Stdout = w
-	cmd.Stderr = w
-
-	if err := cmd.Start(); err != nil {
-		win.Fprintf("body", "%s: %s\n", cmdStr, err)
-		return
-	}
-	w.Close()
-	io.Copy(BodyWriter{win}, r)
-	if err := cmd.Wait(); err != nil {
-		win.Fprintf("body", "%s: %s\n", cmdStr, err)
-	}
-
-	win.Fprintf("body", "%s\n", time.Now())
-	win.Fprintf("addr", "#0")
-	win.Ctl("dot=addr")
-	win.Ctl("show")
-	win.Ctl("clean")
 }
 
 // Events handles events coming from the
 // acme window.
-func events(run chan<- runRequest) {
+func events(win *acme.Win, run chan<- runRequest) {
 	done := make(chan bool)
 	for e := range win.EventChan() {
 		switch e.C2 {
@@ -264,10 +244,4 @@ func events(run chan<- runRequest) {
 		win.WriteEvent(e)
 	}
 	os.Exit(0)
-}
-
-// Die closes the acme window and prints an error.
-func die(err error) {
-	win.Ctl("delete")
-	log.Fatal(err.Error())
 }
