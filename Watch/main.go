@@ -107,7 +107,11 @@ func watcher(path string, run chan<- runRequest) error {
 					return errors.New("Watch point " + path + " deleted")
 				}
 			}
-			run <- runRequest{time.Now(), done}
+			tstamp := time.Now()
+			if info, err := os.Stat(ev.Name); err == nil {
+				tstamp = info.ModTime()
+			}
+			run <- runRequest{tstamp, done}
 			<-done
 
 		case err := <-w.Errors:
